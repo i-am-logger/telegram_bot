@@ -1,0 +1,51 @@
+[package]
+name = "telegram-bot"
+version = "0.1.0"
+authors = ["Logger <ido.samuelson@gmail.com>"]
+edition = "2021"
+rust-version = "1.76.0"
+description = "Telegram Bot"
+documentation = ""
+homepage = ""
+repository = ""
+license = "MIT"
+keywords = ["telegram", "bot"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.14", features = ["derive"] }
+directories = "5.0.1"
+dotenv = "0.15.0"
+env_logger = "0.11.5"
+grammers-client = "0.6.0"
+grammers-session = "0.5.2"
+log = "0.4.22"
+pretty_env_logger = "0.5.0"
+# crossterm = "0.27.0"
+# tui = { package = "ratatui", version = "0.27.0", default-features = false, features = [
+#   "crossterm",
+#   "serde",
+#   "underline-color",
+# ] }
+tokio = { version = "1.38.0", features = [
+  "rt",
+  "macros",
+  "rt-multi-thread",
+  "fs",
+] }
+# clap = { version = "4.5.7", features = ["derive", "cargo"] }
+
+[features]
+
+[[bin]]
+bench = false
+path = "src/main.rs"
+name = "telegram-bot"
+
+[profile.dev]
+lto = "off"
+
+[profile.release]
+lto = "thin"
+debug = 1
