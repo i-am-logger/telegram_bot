@@ -2,14 +2,17 @@ use anyhow::{Context, Result};
 use clap::{command, Parser, Subcommand};
 use dotenv::dotenv;
 use env_logger::Builder;
-use grammers_client::types::User;
+use grammers_client::types::media::Document;
+use grammers_client::types::{Chat, Downloadable, Media, User};
 use grammers_client::{Client, Config, SignInError};
 use grammers_session::Session;
-use std::env;
+use tokio::fs;
+use tokio::time::sleep;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use log::*;
 use directories::ProjectDirs;
+use serde::Deserialize;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,12 +26,23 @@ enum Commands {
     #[command(about = "Authenticate with Telegram")]
     Auth,
 }
+#[derive(Deserialize, Debug)]
+struct EnvConfig {
+    api_id: i32,
+    api_hash: String,
+    save_dir: String,
+    channel_name: String,
+}
+
+
+const TELEGRAM_SESSION_FILENAME: &str = "telegram.session";
+const CHANNEL_STATE_FILENAME_SUFFIX: &str = "state.txt";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init();
-    let client = connect().await?;
+    let config = init()?;
+    let client = connect(&config).await?;
     info!("Connected to Telegram!");
 
     match &cli.command {
@@ -37,34 +51,36 @@ async fn main() -> Result<()> {
         }
         None => {
             let user = logged_in(&client).await?;
-            start(&client, &user).await?;
+            start(config, &client, &user).await?;
         }
     }
 
     Ok(())
 }
 
-fn init() {
+fn init() -> Result<EnvConfig> { 
     dotenv().ok(); // This will load the .env file if it exists
     // Set up logging
     Builder::new()
         .filter(None, LevelFilter::Warn) // default log level
         .filter(Some("telegram_bot"), LevelFilter::Info)
         .init();
+
+    let config = envy::from_env::<EnvConfig>()?;
+    Ok(config)
 }
 
-async fn connect() -> Result<Client> {
-    let (api_id, api_hash) = get_api_credentials()?;
-    debug!("API ID: {}", api_id);
-    debug!("API Hash: {}", api_hash);
+async fn connect(config: &EnvConfig) -> Result<Client> {
+    debug!("API ID: {}", config.api_id);
+    debug!("API Hash: {}", config.api_hash);
     info!("Starting Telegram client...");
-    let session_file = get_session_file_path()?;
+    let session_file = get_data_file_path(TELEGRAM_SESSION_FILENAME)?;
     debug!("Using session file: {:?}", session_file);
 
     // Create a new client
     let client = Client::connect(Config {
-        api_id,
-        api_hash: api_hash.clone(),
+        api_id: config.api_id,
+        api_hash: config.api_hash.clone(),
         session: Session::load_file_or_create(&session_file)?,
         params: Default::default(),
     })
@@ -90,7 +106,7 @@ async fn authenticate(client: &Client) -> Result<()> {
             println!("Signed in successfully!");
         }
     }
-    let session_file = get_session_file_path()?;
+    let session_file = get_data_file_path(TELEGRAM_SESSION_FILENAME)?;
     client.session().save_to_file(&session_file)?;
     println!("Session saved to: {:?}", session_file);
     Ok(())
@@ -110,17 +126,79 @@ async fn logged_in(client: &Client) -> Result<User> {
     Ok(me)
 }
 
-async fn start(_client: &Client, me: &User) -> Result<()> {
+async fn start(config: EnvConfig, client: &Client, me: &User) -> Result<()> {
     info!("I am : {}", me.full_name());
+    let channel_name = config.channel_name.as_str();
+    let chat = client.resolve_username(channel_name).await?
+        .context(format!("Failed to resolve channel: {}", channel_name))?;
+    process_messages(client, &chat ,channel_name, config.save_dir ).await?;
     Ok(())
 }
 
-fn get_session_file_path() -> Result<PathBuf> {
+async fn process_messages(client: &Client, channel: &Chat, channel_name: &str, save_dir: String) -> Result<()> {
+    info!("Monitoring chat: {}", channel_name);
+    let mut offset_id:i32 = read_channel_state(&channel_name).await?;
+    loop {
+        
+        let mut messages = client.iter_messages(channel).limit(50);
+        let mut new_messages = Vec::new();
+        
+        while let Some(message) = messages.next().await? {
+            if message.id() <= offset_id {
+                debug!("read it all... {}", offset_id);
+                break;
+            }
+
+            new_messages.push(message);
+        }
+        for message in new_messages.into_iter().rev() {
+            
+            message.mark_as_read().await?;
+            match message.media() {
+                Some(Media::Document(document)) => {
+                    info!("File received - Type: {}, Name: {}, Size: {} bytes, ID: {}", 
+                        document.mime_type().unwrap_or("Unknown"),
+                        document.name(),
+                        document.size(),
+                        message.id());
+
+                    save_file(client, &document,&save_dir).await?;
+                    info!("File saved...") 
+                }
+                _ => {
+                    info!("Type: {:?}, Message: {}, id: {}", message.media(), message.text(), message.id());
+                },
+            }
+            offset_id = message.id();
+        }
+        write_channel_state(channel_name,offset_id).await?;
+        sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+fn get_data_file_path(filename: &str) -> Result<PathBuf> {
     let proj_dirs = ProjectDirs::from("com", "Logger", "Telegram_Bot")
         .context("Failed to get project directories")?;
     let data_dir = proj_dirs.data_dir();
     std::fs::create_dir_all(data_dir)?;
-    Ok(data_dir.join("telegram.session"))
+    Ok(data_dir.join(filename))
+}
+
+async fn read_channel_state(channel_name: &str) -> Result<i32> {
+    let filename  = format!("{}{}",CHANNEL_STATE_FILENAME_SUFFIX, channel_name);
+    let path = get_data_file_path(&filename)?;
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let content = fs::read_to_string(path).await?;
+    Ok(content.trim().parse()?)
+}
+
+async fn write_channel_state(channel_name: &str, state: i32) -> Result<()> {
+    let filename  = format!("{}{}",CHANNEL_STATE_FILENAME_SUFFIX, channel_name);
+    let path = get_data_file_path(&filename)?;
+    fs::write(path, state.to_string()).await?;
+    Ok(())
 }
 
 fn read_line(prompt: &str) -> Result<String> {
@@ -131,13 +209,16 @@ fn read_line(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-// Read API credentials from environment variables
-fn get_api_credentials() -> Result<(i32, String)> {
-    let api_id: i32 = env::var("API_ID")
-        .context("API_ID not set")?
-        .parse()
-        .context("Failed to parse API_ID")?;
-    let api_hash = env::var("API_HASH").context("API_HASH not set")?;
+async fn save_file(client: &Client, document: &Document, save_dir: &String) -> Result<()> {
+    let save_path = PathBuf::from(save_dir).join(&document.name());
 
-    Ok((api_id, api_hash))
+    if let Some(parent) = save_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let media = Media::Document(document.clone());
+    let download_file = Downloadable::Media(media);
+    client.download_media(&download_file, save_path).await?;
+
+    Ok(())
 }
